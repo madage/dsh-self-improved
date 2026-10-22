@@ -6,7 +6,7 @@
  */
 import z from "@deepseek-ai/schemastery";
 import type { Context } from "@deepseek-ai/cordis";
-import { settingsNamespace } from "@deepseek-ai/dsh-settings";
+import type { IncomingMessage, ServerResponse } from "node:http";
 
 // 服务类型增强：把各 dsh-* 包的 `declare module '@deepseek-ai/cordis'` 类型增强引入本次编译。
 import "@deepseek-ai/dsh-session";
@@ -15,6 +15,9 @@ import "@deepseek-ai/dsh-system-prompt";
 import "@deepseek-ai/dsh-llm";
 import "@deepseek-ai/dsh-schedule";
 import "@deepseek-ai/dsh-session-query";
+import "@deepseek-ai/dsh-host-webserver";
+import "@deepseek-ai/dsh-settings";
+import "@deepseek-ai/cordis-plugin-loader";
 
 import { MemoryStore, defaultMemoryDir } from "./storage.js";
 import { installCapture } from "./capture.js";
@@ -29,8 +32,15 @@ import { BlockAssembler, createUserMessage } from "@deepseek-ai/dsh-llm";
 
 export const name = "self-improved";
 
-/** 需要的宿主服务（Cordis inject 列表；M1 新增 sessionQuery 用于对话全文搜索） */
-export const inject = ["sessions", "settings", "tools", "sessionQuery", "llm"] as const;
+/** 需要的宿主服务（Cordis inject 列表；0.2.0：设置页由 Config schema 自动生成，不再依赖 settings 服务） */
+/**
+ * 需要的宿主服务（静态 inject：loader 在 apply 前解析进同一上下文）。
+ * ⚠️ 0.2.0 cordis 强制服务属性访问必须有 inject 声明（"cannot get property X without inject"），
+ * 且动态 ctx.inject(["webServer"], cb) 的子 fiber 会解析到错误实例/静默 PENDING——
+ * 必须像 dsh-usage 一样走静态声明 + ctx.webServer 直接注册。
+ * 代价：headless 装配没有 webServer，本插件将无法在 headless 加载（web 场景专用，可接受）。
+ */
+export const inject = ["sessions", "tools", "sessionQuery", "llm", "webServer", "settings"] as const;
 
 /** 模块开关（联动规则见 docs/design/dsh-memory-detailed-design.md §2.5） */
 export interface ModuleSwitches {
@@ -114,11 +124,18 @@ export interface Config {
   review: { enabled: boolean; time: string };
 }
 
+/**
+ * 0.2.0 设置模型：本 schema 即设置页（命名空间 = profile 条目 id），除 storageRoot 外
+ * 全部标记 volatile()——设置页保存时 Loader 把新值原地提交进运行 fiber 并派发
+ * loader/volatile-update（不重挂载本条目），apply() 内监听该事件热应用。
+ * storageRoot 保持普通字段：改动走整条目重挂载 = 重建 MemoryStore，语义正确。
+ * 注意：volatile 字段解析产物是引用（带 .get()），apply 入口用 resolveConfig 解包。
+ */
 export const Config = z.object({
-  enabled: z.boolean().default(true),
-  debug: z.boolean().default(false),
+  enabled: z.boolean().default(true).volatile(),
+  debug: z.boolean().default(false).volatile(),
   storageRoot: z.string().default(""),
-  searchLimit: z.number().min(1).max(50).default(5),
+  searchLimit: z.number().min(1).max(50).default(5).volatile(),
   modules: z.object({
     capture: z.boolean().default(true),
     extract: z.boolean().default(true),
@@ -126,7 +143,7 @@ export const Config = z.object({
     evolve: z.boolean().default(true),
     recall: z.boolean().default(true),
     tools: z.boolean().default(true),
-  }),
+  }).volatile(),
   extract: z.object({
     intervalMinutes: z.number().min(1).default(15),
     batchMaxChars: z.number().min(2000).max(100000).default(12000),
@@ -138,7 +155,7 @@ export const Config = z.object({
     flushDrain: z.boolean().default(false),
     model: z.string().default(""),
     provider: z.string().default(""),
-  }),
+  }).volatile(),
   recall: z.object({
     strategy: z.string().default("keyword"),
     maxResults: z.number().min(1).max(20).default(5),
@@ -152,12 +169,12 @@ export const Config = z.object({
       dimensions: z.number().min(64).default(1024),
       timeoutMs: z.number().min(1000).default(10000),
     }),
-  }),
+  }).volatile(),
   consolidate: z.object({
     sceneMaxMemories: z.number().min(1).default(50),
     personaMaxMemories: z.number().min(1).default(30),
     sceneBatchSize: z.number().min(1).max(20).default(8),
-  }),
+  }).volatile(),
   evolve: z.object({
     decay: z.object({
       enabled: z.boolean().default(true),
@@ -173,30 +190,49 @@ export const Config = z.object({
       prefix: z.string().default("dsi-"),
       maxSkills: z.number().min(0).default(100),
     }),
-  }),
+  }).volatile(),
   housekeeping: z.object({
     personaVersions: z.number().min(1).default(10),
     maxScenes: z.number().min(1).default(50),
     sceneActiveRatio: z.number().min(0).max(1).default(0.3),
     conversationRetentionDays: z.number().min(0).default(90),
-  }),
+  }).volatile(),
   review: z.object({
     enabled: z.boolean().default(true),
     time: z.string().default("22:00"),
-  }),
+  }).volatile(),
 });
 
-export function apply(ctx: Context, config: Config): void {
+export function apply(ctx: Context, rawConfig: Config): void {
+  // ⓪ 0.2.0 volatile 配置解包：volatile 字段以引用（{ get(): value }）形式提交进运行 fiber，
+  //    这里统一解成普通值；loader/volatile-update 时重新解析并热应用（见下方 ⑦）。
+  const readLeaf = <T>(field: unknown): T => {
+    if (field !== null && typeof field === "object" && typeof (field as { get?: unknown }).get === "function") {
+      return (field as { get: () => T }).get();
+    }
+    return field as T;
+  };
+  const VOLATILE_KEYS = ["enabled", "debug", "searchLimit", "modules", "extract", "recall", "consolidate", "evolve", "housekeeping", "review"] as const;
+  const resolveConfig = (raw: unknown): Config => {
+    const src = (raw ?? {}) as Record<string, unknown>;
+    const out = { ...src };
+    for (const key of VOLATILE_KEYS) out[key] = readLeaf(out[key]);
+    return out as unknown as Config;
+  };
+  let config = resolveConfig(rawConfig);
+
   const log = (...args: unknown[]): void => {
     if (config.debug) console.log("[dsh-self-improved]", ...args);
   };
 
-  // ① 设置命名空间：Web UI 设置页自动渲染表单 + settings/updated 热应用（随时开关的核心）
-  const ns = settingsNamespace("dsh-self-improved");
-  const scope = ctx.settings.register(ns, Config, { base: config });
-  log("settings namespace registered");
+  // ⓪' 可选：抑制宿主按 Config schema 自动生成的设置页（本插件 client.js 提供自定义设置 UI，
+  //    避免设置导航出现重复两项）。注意 owner 必须显式传本插件自己的 fiber——
+  //    缺省值是 SettingsForms 服务所有者的 fiber（宿主根），policy 永远匹配不到任何条目。
+  //    settings 服务缺席（极端裁剪装配）时静默跳过。
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  try { (ctx as any).settings?.configure?.({ auto: false }, (ctx as any).fiber); } catch { /* 尽力而为 */ }
 
-  // 运行时可变状态（M5：总开关/模块开关随时切换，无需重启）
+  // 运行时可变状态（M5：总开关/模块开关随时切换，无需重启；0.2.0 经 volatile-update 热应用）
   const state = { enabled: config.enabled, modules: { ...config.modules } };
   const readModule = (m: keyof ModuleSwitches): boolean => state.enabled && state.modules[m];
 
@@ -218,7 +254,11 @@ export function apply(ctx: Context, config: Config): void {
     minImportance: config.extract.minImportance,
     flushDrain: config.extract.flushDrain,
   };
-  const embeddingProvider = createOpenAiEmbedding(config.recall.embedding);
+  let embeddingProvider = createOpenAiEmbedding(config.recall.embedding);
+  /** embedding 端点指纹：变化时才重建管线实例（见 ⑦ rewirePipeline） */
+  const embeddingKey = (e: typeof config.recall.embedding): string =>
+    `${(e.baseUrl ?? "").trim()}|${(e.model ?? "").trim()}|${e.apiKey ? "set" : "unset"}|${e.dimensions}|${e.timeoutMs}`;
+  let lastEmbeddingKey = embeddingKey(config.recall.embedding);
 
   // 通用 LLM 调用器（提取/巩固/技能合成共用；复用 DSH 模型栈）
   const makeLlmCall = (purpose: string, maxTokens: number) =>
@@ -229,7 +269,8 @@ export function apply(ctx: Context, config: Config): void {
         messages: [
           createUserMessage({
             content: [{ type: "text", text: input.user }],
-            source: { kind: "plugin", plugin: "dsh-self-improved" },
+            // 0.2.0：MessageSource 无公共 "plugin" kind；一次性合成调用即普通 user 输入
+            source: { kind: "user" },
           }),
         ],
         system: input.system,
@@ -268,7 +309,7 @@ export function apply(ctx: Context, config: Config): void {
     };
   const extractLlm = makeLlmCall("memory-extract", extractSettings.maxOutputTokens);
 
-  const extractor = new Extractor(store, extractSettings, async ({ system, user, sessionId, signal }) => {
+  let extractor = new Extractor(store, extractSettings, async ({ system, user, sessionId, signal }) => {
     if (config.debug) {
       console.log("[dsh-self-improved] extract llm input:", typeof user, "len:", String(user).length, "session:", sessionId);
     }
@@ -284,7 +325,7 @@ export function apply(ctx: Context, config: Config): void {
 
   // 定时进化管线（dsh-schedule 不在 headless base 装配中，用进程内定时器）
   const consolidateLlm = makeLlmCall("memory-consolidate", 2000);
-  const consolidator = new Consolidator(
+  let consolidator = new Consolidator(
     store,
     {
       sceneMaxMemories: config.consolidate.sceneMaxMemories,
@@ -471,15 +512,17 @@ export function apply(ctx: Context, config: Config): void {
   };
   syncTools();
 
-  // ⑤ 召回注入（M3）：agent/pre-step 自动注入相关记忆
+  // ⑤ 召回注入（M3）：agent/pre-step 自动注入相关记忆。
+  //    recallSettings 原地更新即生效（RecallService 每次检索读字段）；
+  //    embedding 端点变化时整个 recall 实例由 ⑦ 重建，注入器持稳定代理不受影响。
   const recallSettings: RecallSettings = {
     strategy: config.recall.strategy === "hybrid" ? "hybrid" : "keyword",
     maxResults: config.recall.maxResults,
     scoreThreshold: config.recall.scoreThreshold,
     timeoutMs: config.recall.timeoutMs,
   };
-  const recall = new RecallService(store, recallSettings, embeddingProvider);
-  installRecallInjection(ctx, recall, {
+  let recall = new RecallService(store, recallSettings, embeddingProvider);
+  installRecallInjection(ctx, { search: (q, o) => recall.search(q, o) }, {
     enabled: () => readModule("recall"),
     maxHits: config.recall.maxResults,
     maxChars: config.recall.maxInjectChars,
@@ -508,95 +551,200 @@ export function apply(ctx: Context, config: Config): void {
   };
   syncCommands();
 
-  // ⑦ 热应用：settings/updated → 更新运行时状态（随时开关，无需重启）
-  scope.watch((next) => {
-    state.enabled = next.enabled;
-    state.modules = { ...next.modules };
-    extractSettings.enabled = readModule("extract");
+  // ⑦ 热应用（0.2.0）：设置页保存 volatile 字段 → Loader 原地提交进运行 fiber →
+  //    loader/volatile-update（只发给本 fiber）→ 重新解析 config 并热应用，无需重启。
+  ctx.on("loader/volatile-update", () => {
+    config = resolveConfig(rawConfig);
+    state.enabled = config.enabled;
+    state.modules = { ...config.modules };
+    Object.assign(extractSettings, {
+      enabled: readModule("extract"),
+      intervalMinutes: config.extract.intervalMinutes,
+      batchMaxChars: config.extract.batchMaxChars,
+      maxOutputTokens: config.extract.maxOutputTokens,
+      timeoutMs: config.extract.timeoutMs,
+      dedup: config.extract.dedup,
+      fallbackOnBadJson: config.extract.fallbackOnBadJson,
+      minImportance: config.extract.minImportance,
+      flushDrain: config.extract.flushDrain,
+    });
+    recallSettings.strategy = config.recall.strategy === "hybrid" ? "hybrid" : "keyword";
+    recallSettings.maxResults = config.recall.maxResults;
+    recallSettings.scoreThreshold = config.recall.scoreThreshold;
+    recallSettings.timeoutMs = config.recall.timeoutMs;
+    // embedding 端点配置变化 → 重建管线实例（extractor/consolidator/recall 构造时捕获 provider）
+    const key = embeddingKey(config.recall.embedding);
+    if (key !== lastEmbeddingKey) {
+      lastEmbeddingKey = key;
+      embeddingProvider = createOpenAiEmbedding(config.recall.embedding);
+      extractor = new Extractor(store, extractSettings, async ({ system, user, sessionId, signal }) => {
+        if (config.debug) console.log("[dsh-self-improved] extract llm input:", typeof user, "len:", String(user).length, "session:", sessionId);
+        return extractLlm({ system, user, sessionId, signal });
+      }, embeddingProvider);
+      consolidator = new Consolidator(
+        store,
+        {
+          sceneMaxMemories: config.consolidate.sceneMaxMemories,
+          personaMaxMemories: config.consolidate.personaMaxMemories,
+          sceneBatchSize: config.consolidate.sceneBatchSize,
+        },
+        async ({ system, user, signal }) => consolidateLlm({ system, user, signal }),
+        embeddingProvider,
+      );
+      recall = new RecallService(store, recallSettings, embeddingProvider);
+      log("embedding endpoint changed — pipeline rewired");
+    }
     syncTools();
     syncCommands(); // 总开关关闭 → 注销 /memory 命令；打开 → 重新注册
-    // 夜间回顾时间/开关热切换：重新武装定时器
-    if (next.review.enabled !== config.review.enabled || next.review.time !== config.review.time) {
-      config.review = { enabled: next.review.enabled, time: next.review.time };
-    }
     // 任何运行时配置变化 → 统一重挂功能定时器（关闭总开关=全部定时器立即停止）
     syncSchedulers();
-    log("runtime config applied:", "enabled=", next.enabled, "modules=", JSON.stringify(next.modules));
+    log("runtime config applied (volatile-update): enabled=", config.enabled, "modules=", JSON.stringify(config.modules));
   });
 
-  // ⑧ 记忆浏览器数据通道（设置页前端无需 session 即可读取/操作记忆）：
-  //    专用命名空间 dsh-self-improved-browser：snapshot=快照 JSON，action=前端发来的操作
-  const browserNs = settingsNamespace("dsh-self-improved-browser");
-  const BrowserSchema = z.object({
-    snapshot: z.string().default("{}"),
-    action: z.string().default(""),
-    detail: z.string().default(""),
-  });
-  const browserScope = ctx.settings.register(browserNs, BrowserSchema);
-  let lastSnapshotJson = "";
-  let lastHandledAction = "";
-  const refreshBrowserSnapshot = (): void => {
-    try {
-      const json = JSON.stringify(browserSnapshot(store));
-      if (json === lastSnapshotJson) return;
-      lastSnapshotJson = json;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const cur = (browserScope.get() ?? {}) as any;
-      browserScope.replace({ snapshot: json, action: cur.action ?? "" }).catch(() => { /* 尽力而为 */ });
-    } catch {
-      /* noop */
-    }
-  };
-  const handleBrowserAction = (raw: string): void => {
-    if (!raw || raw === lastHandledAction) return;
-    lastHandledAction = raw;
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const action = JSON.parse(raw) as any;
-      // 详情：按需返回完整记忆（快照里内容是截断的）
-      if (action.op === "detail" && typeof action.id === "string") {
-        const m = store.getMemory(action.id);
-        if (m) {
-          browserScope
-            .replace({ snapshot: lastSnapshotJson, action: "", detail: JSON.stringify(m) })
-            .catch(() => { /* noop */ });
-        }
-        return; // 详情不需要刷新快照
+  // ⑧ 数据通道（0.2.0）：settingsNamespace 已移除，改挂 webServer HTTP 端点。
+  //    GET  /api/dsh-self-improved/browser → 记忆快照 JSON
+  //    POST /api/dsh-self-improved/action  → {op:...} 操作，响应 {ok, snapshot, detail?}
+  //    GET  /api/dsh-self-improved/config  → 设置描述符（value/base/user/revision，apiKey 置空）
+  //    POST /api/dsh-self-improved/config  → {ops, expectedRevision} 设置变更（走 SettingsForms.mutate
+  //                                          → loader volatile 热应用；revision 冲突返回 409）
+  //    官方 configForms 表单在非 loopback 页面被宿主置为 memory 模式（一律 unavailable），
+  //    本通道让设置 UI 在 Tailscale/配对访问下照常工作。
+  //    路由经静态 inject 的 ctx.webServer 直接注册（webServer 已加入插件 inject 列表；
+  //    动态 ctx.inject 子 fiber 冷启动会解析到错误实例/静默 PENDING，勿改回）。
+  //    访问栅栏对齐 dsh-usage：loopback 放行，非 loopback 需 remote-web-ui 配对设备。
+  {
+    // 实例诊断（静态 inject 后 ctx.webServer 即监听实例，不再有双实例问题）
+    const isLoopbackRequest = (req: IncomingMessage): boolean => {
+      const addr = req.socket.remoteAddress ?? "";
+      return addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
+    };
+    const isAllowed = (req: IncomingMessage): boolean => {
+      if (isLoopbackRequest(req)) return true;
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const pairing = (ctx as any).get?.("remoteWebUiPairing");
+        return typeof pairing?.isPairedDevice === "function" ? pairing.isPairedDevice(req) === true : false;
+      } catch {
+        return false;
       }
-      if (action.op === "forget" && typeof action.id === "string") {
-        store.forgetMemory(action.id);
-        log("browser action: forget", action.id.slice(0, 8));
-      } else if (action.op === "correct" && typeof action.id === "string" && typeof action.content === "string") {
-        const old = store.getMemory(action.id);
-        if (old) {
-          store.insertMemory({ kind: old.kind, content: action.content, importance: old.importance, supersedes: old.id });
-          store.setMemoryStatus(old.id, "corrected");
-          log("browser action: correct", action.id.slice(0, 8));
-        }
-      } else if (action.op === "deleteSkill" && typeof action.name === "string") {
-        if (deleteSkill(action.name, config.evolve.skillSynthesis.skillsRoot)) {
-          log("browser action: deleteSkill", action.name);
-        }
+    };
+    const writeJson = (res: ServerResponse, status: number, body: unknown): void => {
+      res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+      res.end(JSON.stringify(body));
+    };
+    const readBody = async (req: IncomingMessage): Promise<string> => {
+      let body = "";
+      req.setEncoding("utf8");
+      for await (const chunk of req) body += chunk;
+      return body;
+    };
+    // 设置表单 HTTP 通道（非 loopback 页面官方 configForms 持久化为 memory、一律 unavailable；
+    // 本通道经宿主侧 SettingsForms 读写，配合上方栅栏在 Tailscale/配对访问下可用）。
+    // apiKey 以空串下发（留空=保持现值），避免明文回传浏览器。
+    const NS = "dsh-self-improved";
+    const blankApiKey = (section: unknown): void => {
+      if (section !== null && typeof section === "object") {
+        const embedding = (section as { recall?: { embedding?: { apiKey?: unknown } } }).recall?.embedding;
+        if (embedding && typeof embedding.apiKey === "string") embedding.apiKey = "";
       }
-    } catch {
-      /* noop */
-    }
-    lastSnapshotJson = ""; // 强制下次刷新
-    refreshBrowserSnapshot();
-    browserScope.replace({ snapshot: lastSnapshotJson, action: "" }).catch(() => { /* noop */ });
-  };
-  browserScope.watch((next, _prev) => {
-    if (next.action) handleBrowserAction(next.action);
-  });
-  refreshBrowserSnapshot();
-  const browserTimer = setInterval(refreshBrowserSnapshot, 60_000);
-  browserTimer.unref?.();
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (ctx as any).on("dispose", () => clearInterval(browserTimer));
-  log("memory browser channel ready (dsh-self-improved-browser)");
+    };
+    const describeConfig = (): Record<string, unknown> | null => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const settings = ctx.settings;
+      if (!settings?.describe) return null;
+      const row = settings.describe().find((d: { ns: string }) => d.ns === NS);
+      if (!row) return null;
+      const value = structuredClone(row.value ?? {});
+      const base = structuredClone(row.base ?? {});
+      const user = structuredClone(row.user ?? {});
+      blankApiKey(value);
+      blankApiKey(base);
+      blankApiKey(user);
+      return { ns: row.ns, revision: row.revision, value, base, user, autoGenerate: row.autoGenerate };
+    };
+    const disposers = [
+      ctx.webServer.register({
+        kind: "exact",
+        path: "/api/dsh-self-improved/config",
+        handler: async (req, res) => {
+          console.log("[dsh-self-improved] CONFIG handler hit:", req.method);
+          if (!isAllowed(req)) return writeJson(res, 403, { ok: false, error: "forbidden" });
+          if (req.method === "GET") {
+            const descriptor = describeConfig();
+            if (!descriptor) return writeJson(res, 404, { ok: false, error: "entry not active" });
+            return writeJson(res, 200, { ok: true, descriptor });
+          }
+          if (req.method !== "POST") return writeJson(res, 405, { ok: false, error: "method not allowed" });
+          const settings = ctx.settings;
+          if (!settings?.mutate) return writeJson(res, 503, { ok: false, error: "settings service unavailable" });
+          try {
+            const body = JSON.parse(await readBody(req)) as { ops?: unknown; expectedRevision?: number };
+            if (!Array.isArray(body.ops)) return writeJson(res, 400, { ok: false, error: "ops must be an array" });
+            await settings.mutate(NS, body.ops, body.expectedRevision);
+            const descriptor = describeConfig();
+            writeJson(res, 200, { ok: true, descriptor });
+          } catch (error) {
+            const name = (error as { name?: string }).name ?? "";
+            const code = (error as { code?: string }).code ?? "";
+            if (name === "SettingsConflictError" || code === "SETTINGS_CONFLICT") {
+              return writeJson(res, 409, { ok: false, code: "conflict", error: String((error as Error).message ?? "conflict") });
+            }
+            writeJson(res, 400, { ok: false, error: String(error) });
+          }
+        },
+      }),
+      ctx.webServer.register({
+        kind: "exact",
+        path: "/api/dsh-self-improved/action",
+        handler: async (req, res) => {
+          if (!isAllowed(req)) return writeJson(res, 403, { ok: false, error: "forbidden" });
+          if (req.method !== "POST") return writeJson(res, 405, { ok: false, error: "method not allowed" });
+          let detail: unknown;
+          try {
+            const action = JSON.parse(await readBody(req)) as Record<string, unknown>;
+            // 详情：按需返回完整记忆（快照里内容是截断的）
+            if (action.op === "detail" && typeof action.id === "string") {
+              detail = store.getMemory(action.id) ?? null;
+              return writeJson(res, 200, { ok: true, detail, snapshot: browserSnapshot(store) });
+            }
+            if (action.op === "forget" && typeof action.id === "string") {
+              store.forgetMemory(action.id);
+              log("browser action: forget", action.id.slice(0, 8));
+            } else if (action.op === "correct" && typeof action.id === "string" && typeof action.content === "string") {
+              const old = store.getMemory(action.id);
+              if (old) {
+                store.insertMemory({ kind: old.kind, content: action.content, importance: old.importance, supersedes: old.id });
+                store.setMemoryStatus(old.id, "corrected");
+                log("browser action: correct", action.id.slice(0, 8));
+              }
+            } else if (action.op === "deleteSkill" && typeof action.name === "string") {
+              if (deleteSkill(action.name, config.evolve.skillSynthesis.skillsRoot)) {
+                log("browser action: deleteSkill", action.name);
+              }
+            }
+          } catch (error) {
+            return writeJson(res, 400, { ok: false, error: String(error) });
+          }
+          writeJson(res, 200, { ok: true, snapshot: browserSnapshot(store) });
+        },
+      }),
+      ctx.webServer.register({
+        kind: "exact",
+        path: "/api/dsh-self-improved/browser",
+        handler: (req, res) => {
+          if (!isAllowed(req)) return writeJson(res, 403, { ok: false, error: "forbidden" });
+          try {
+            writeJson(res, 200, { ok: true, snapshot: browserSnapshot(store) });
+          } catch (error) {
+            writeJson(res, 500, { ok: false, error: String(error) });
+          }
+        },
+      }),
+    ];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (ctx as any).on("dispose", () => { for (const d of disposers) { try { d(); } catch { /* noop */ } } });
+    log("memory browser HTTP channel ready (/api/dsh-self-improved/*)");
+  }
 
-  // ⑥ 后台管线（M2 起：extract/consolidate/evolve，dsh-schedule 驱动）
-  // 注：M0 已确认 schedule 服务不在 headless base 装配中，引入时需按装配判断
-
-  log("dsh-self-improved 已加载（M5 完整版）");
+  log("dsh-self-improved 已加载（0.2.0 移植版）");
 }

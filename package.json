@@ -1,6 +1,6 @@
 {
   "name": "dsh-self-improved",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "DeepSeek Harness 长期记忆与自进化插件：L0 对话捕获 → L1 记忆提取 → L2 场景归纳 → L3 用户画像，自动召回注入 + 技能合成，纯本地。",
   "type": "module",
   "main": "lib/index.js",
@@ -14,10 +14,17 @@
     "./package.json": "./package.json"
   },
   "dsh": {
+    "engines": {
+      "dsh": ">=0.2.0-rc.2"
+    },
     "bundle": {
       "patch": "./cordis.patch.yml"
     },
     "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
       "platform": "web"
     }
   },
@@ -35,22 +42,38 @@
     "sqlite-vec": "0.1.7-alpha.2"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-agent": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-home-paths": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-llm": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-schedule": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-session": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-settings": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-skill": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-storage-domain": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-system-prompt": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
-    "@deepseek-ai/schemastery": "^3.18.1"
+    "@deepseek-ai/cordis": ">=4.0.2 <5.0.0",
+    "@deepseek-ai/dsh-agent": ">=0.1.5-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-home-paths": ">=0.1.5-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-host-webserver": ">=0.1.5-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-llm": ">=0.1.5-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-schedule": ">=0.1.5-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-session": ">=0.1.5-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-session-query": ">=0.1.5-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-settings": ">=0.1.5-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-skill": ">=0.1.5-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-storage-domain": ">=0.1.5-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-system-prompt": ">=0.1.5-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-tools": ">=0.1.5-rc.2 <0.3.0",
+    "@deepseek-ai/schemastery": ">=3.18.1 <4.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
-    "typescript": "^5.7.0"
+    "@deepseek-ai/cordis": "4.0.5",
+    "@deepseek-ai/dsh-agent": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-home-paths": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-host-webserver": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-schedule": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session-query": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-skill": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-storage-domain": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
+    "@deepseek-ai/schemastery": "3.18.4",
+    "typescript": "^5.7.0",
+    "@deepseek-ai/dsh-settings": "0.2.0-rc.2"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

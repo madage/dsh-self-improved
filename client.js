@@ -1,17 +1,21 @@
 /**
  * dsh-self-improved — browser half.
  *
- * A "自进化记忆" section inside the Web UI settings page: edits the
- * `dsh-self-improved` settings namespace (master switch, module switches,
- * storage, extraction LLM, recall/embedding, consolidate, evolve) through the
- * settings scope transport plus nested `settings.mutate` ops. Changes are
- * hot-applied server-side (settings/updated watch) — no restart needed.
+ * A "自进化记忆" section inside the Web UI settings page. 0.2.0 model:
+ * - Config tab reads/writes the profile entry's config through the plugin's own
+ *   HTTP endpoints (GET/POST `api/dsh-self-improved/config` → host-side
+ *   SettingsForms). The official configForms forms are hard-unavailable on
+ *   non-loopback pages (memory persistence mode), so the plugin ships its own
+ *   loopback/pairing-fenced transport; volatile fields hot-apply server-side
+ *   via `loader/volatile-update` — no restart needed.
+ * - Memory tab talks to the plugin's own HTTP endpoints registered on the
+ *   host webServer (`/api/dsh-self-improved/*`) — no session context required.
  *
  * Style aligned with the DSH settings UI (14px base, 34px controls, 12px
  * radius, theme tokens); a "?" help toggle provides a detailed plugin guide.
  *
  * Hand-written ModuleLoader bundle — no build step required.
- * Pattern reference: dsh-tdai-memory client.js (MIT).
+ * Pattern reference: dsh-usage / dsh-client-ui-settings (0.2.0).
  */
 window.__ModuleLoader__.load({
   id: "dsh-self-improved",
@@ -98,7 +102,7 @@ window.__ModuleLoader__.load({
 
     // ── locale ────────────────────────────────────────────────────────────
     var NS = "selfImproved";
-    var inject = ["slots", "locale", "settingsScope", "connection"];
+    var inject = ["slots", "locale"];
     var zh = {
       nav: "自进化记忆",
       tabConfig: "配置",
@@ -154,8 +158,8 @@ window.__ModuleLoader__.load({
       saved: "已保存并立即生效",
       saving: "保存中…",
       error: "保存失败",
-      conflict: "配置已被其他修改（版本冲突）：已刷新最新配置，你改动的内容已保留，请再点一次保存",
-      unavailable: "设置命名空间不可用（服务端未注册 dsh-self-improved？）",
+      conflict: "配置保存未生效（可能已被其他修改）：已自动刷新最新配置，请重试",
+      unavailable: "设置表单不可用（HTTP 通道不可达：插件未启用，或宿主尚未重载到带 /config 端点的版本）",
       overridden: "已覆盖",
       loading: "加载中…",
       fEnabled: "启用插件（总开关）",
@@ -209,8 +213,7 @@ window.__ModuleLoader__.load({
       fReviewTime: "回顾时间（HH:MM，24 小时制）",
       secretHint: "留空保持当前密钥。",
       browserNav: "记忆",
-      browserNoSession: "记忆浏览器需要在会话上下文中运行：请先打开/进入一个会话后再查看（聊天输入框敲 / 打开命令菜单也可管理记忆）。",
-      browserHint: "加载中…（数据来自 /memory browser --json）",
+      browserHint: "加载中…（数据来自本地记忆库 /api/dsh-self-improved/browser）",
       browserSearch: "筛选（关键词）",
       browserRefresh: "刷新",
       browserSummary: "共 {n} 条活跃记忆 · 待提取 {p} · 场景 {s} · 画像 v{v} · 技能 {k}",
@@ -298,8 +301,8 @@ window.__ModuleLoader__.load({
       saved: "Saved — applied immediately",
       saving: "Saving…",
       error: "Save failed",
-      conflict: "Config changed elsewhere (revision conflict): refreshed to latest, your edits are kept — please save again",
-      unavailable: "Settings namespace unavailable (dsh-self-improved not registered server-side?)",
+      conflict: "Save not applied (changed elsewhere): refreshed to the latest config — please retry",
+      unavailable: "Settings form unavailable (HTTP channel unreachable: plugin disabled, or host not yet reloaded with the /config endpoints)",
       overridden: "overridden",
       loading: "Loading…",
       fEnabled: "Enable plugin (master switch)",
@@ -353,8 +356,7 @@ window.__ModuleLoader__.load({
       fReviewTime: "Review time (HH:MM, 24h)",
       secretHint: "Leave blank to keep the current key.",
       browserNav: "Memory",
-      browserNoSession: "The memory browser needs a session context: open/enter a session first (you can also type \"/\" in chat to open the command menu).",
-      browserHint: "Loading… (data from /memory browser --json)",
+      browserHint: "Loading… (data from the local memory store via /api/dsh-self-improved/browser)",
       browserSearch: "Filter",
       browserRefresh: "Refresh",
       browserSummary: "{n} active memories · {p} pending · {s} scenes · persona v{v} · {k} skills",
@@ -449,11 +451,80 @@ window.__ModuleLoader__.load({
       return cur;
     }
 
+    // ── 0.2.0 设置表单（HTTP 通道）────────────────────────────────────────
+    // 官方 configForms 表单在非 loopback 页面被宿主置为 memory 模式（构造即 unavailable，
+    // 镜像也永不加载），Tailscale/配对访问下整个设置面不可用。本表单改走插件自己的
+    // HTTP 端点（GET/POST api/dsh-self-improved/config），宿主侧经 SettingsForms.mutate
+    // 写入 → loader volatile 热应用；revision 冲突返回 409 → mutate 兑现为 false。
+    // 快照契约与 ConfigFormController 一致：{status, value, base, user, revision, writable}。
+    var CONFIG_API = "api/dsh-self-improved/config";
+    function createHttpConfigForm() {
+      var listeners = [];
+      var snapshot = { status: "loading", value: void 0, base: void 0, user: void 0, revision: void 0, writable: true };
+      function publish() {
+        for (var i = 0; i < listeners.length; i += 1) { try { listeners[i](); } catch (e) { /* noop */ } }
+      }
+      function applyDescriptor(d) {
+        snapshot = {
+          status: "ready",
+          value: d.value !== void 0 ? d.value : {},
+          base: d.base !== void 0 ? d.base : {},
+          user: d.user !== void 0 ? d.user : {},
+          revision: d.revision,
+          writable: true
+        };
+        publish();
+      }
+      function markUnavailable(message) {
+        snapshot = { status: "unavailable", value: void 0, base: void 0, user: void 0, revision: void 0, writable: false, error: message };
+        publish();
+      }
+      function load() {
+        return fetch(CONFIG_API).then(function (r) {
+          if (r.status === 403) throw new Error("forbidden");
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          return r.json();
+        }).then(function (res) {
+          if (!res || !res.ok || !res.descriptor) throw new Error(res && res.error || "no descriptor");
+          applyDescriptor(res.descriptor);
+        }).catch(function (e) {
+          markUnavailable(String(e && e.message || e));
+          throw e;
+        });
+      }
+      load().catch(function () { /* 状态已置 unavailable，由 UI 呈现 */ });
+      return {
+        getSnapshot: function () { return snapshot; },
+        subscribe: function (l) { listeners.push(l); return function () { var i = listeners.indexOf(l); if (i >= 0) listeners.splice(i, 1); }; },
+        load: load,
+        mutate: function (ops, expectedRevision) {
+          return fetch(CONFIG_API, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ ops: ops, expectedRevision: expectedRevision })
+          }).then(function (r) {
+            return r.json().then(function (body) { return { httpStatus: r.status, body: body }; });
+          }).then(function (res) {
+            var body = res.body || {};
+            if (res.httpStatus === 200 && body.ok) {
+              if (body.descriptor) applyDescriptor(body.descriptor);
+              return true;
+            }
+            if (res.httpStatus === 409) {
+              // 版本冲突：以服务端最新描述符刷新快照（草稿保留），UI 提示重试
+              if (body.descriptor) applyDescriptor(body.descriptor);
+              return false;
+            }
+            throw new Error(body.error || "HTTP " + res.httpStatus);
+          });
+        }
+      };
+    }
+
     function MemorySection(props) {
       var t = props.t;
-      var scope = props.scope;
-      var api = props.api;
-      var [snapshot, setSnapshot] = react.useState(function () { return scope.getSnapshot(); });
+      var form = props.form;
+      var [snapshot, setSnapshot] = react.useState(function () { return form.getSnapshot(); });
       var ready = snapshot.status === "ready" && snapshot.value !== void 0;
       var [draft, setDraft] = react.useState({});
       var [busy, setBusy] = react.useState(false);
@@ -462,12 +533,12 @@ window.__ModuleLoader__.load({
       var [showHelp, setShowHelp] = react.useState(false);
 
       react.useEffect(function () {
-        scope.load();
         var alive = true;
-        var sync = function () { if (alive) setSnapshot(scope.getSnapshot()); };
-        var un = typeof scope.subscribe === "function" ? scope.subscribe(sync) : null;
-        return function () { alive = false; if (un) un(); if (scope.dispose) scope.dispose(); };
-      }, [scope]);
+        // 0.2.0：configForms 表单由 describe 镜像自动同步，无需手动 load
+        var sync = function () { if (alive) setSnapshot(form.getSnapshot()); };
+        var un = form.subscribe(sync);
+        return function () { alive = false; if (un) un(); };
+      }, [form]);
       react.useEffect(function () {
         if (ready) setDraft(Object.assign({}, valueToDraft(snapshot.value)));
         // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -491,20 +562,8 @@ window.__ModuleLoader__.load({
         setError(null);
       }
 
-      // 保存失败处理：revision 冲突（命名空间在读取后被其他修改）时刷新最新配置、保留用户草稿，
-      // 提示再次保存；其余错误原样展示
-      function handleMutateFailure(response) {
-        setBusy(false);
-        var detail = response && response.result && response.result.error || {};
-        var msg = String(detail.message || detail.code || "unknown");
-        if (/changed since it was read|revision conflict/i.test(msg)) {
-          scope.load(); // 刷新快照（draft 保留不动）
-          setError(t("conflict"));
-          return;
-        }
-        setError(t("error") + ": " + msg);
-      }
-
+      // 0.2.0：form.mutate 返回 Promise<boolean>——false 表示宿主拒绝（版本冲突等），
+      // 表单内部已自动 recover 刷新最新配置；提示用户重试即可
       function onSave() {
         setBusy(true); setNotice(null); setError(null);
         var ops = [];
@@ -534,16 +593,14 @@ window.__ModuleLoader__.load({
           ops.push(String(d).trim() === "" ? { op: "unset", path: f.path } : { op: "set", path: f.path, value: f.type === "number" ? Number(d) : d });
         }
         if (ops.length === 0) { setBusy(false); setNotice(t("saved")); return; }
-        api.settings.mutate({
-          ns: "dsh-self-improved",
-          ops: ops,
-          ...snapshot.revision === void 0 ? {} : { expectedRevision: snapshot.revision }
-        }).then(function (response) {
-          if (!response.result.ok) { handleMutateFailure(response); return; }
+        form.mutate(ops, snapshot.revision).then(function (accepted) {
           setBusy(false);
-          setNotice(t("saved"));
-          // 注意：不要用响应值重建 draft——响应可能是部分数据，缺字段会被渲染成 false（导致开关全关）
-          scope.load();
+          if (accepted) {
+            setNotice(t("saved"));
+            // 不用响应值重建 draft——保留用户界面状态，等待订阅推送的最新快照
+          } else {
+            setError(t("conflict"));
+          }
         }).catch(function (e) {
           setBusy(false); setError(t("error") + ": " + String(e && e.message || e));
         });
@@ -551,15 +608,10 @@ window.__ModuleLoader__.load({
 
       function onReset() {
         setBusy(true); setNotice(null); setError(null);
-        api.settings.mutate({
-          ns: "dsh-self-improved",
-          ops: FIELDS.map(function (f) { return { op: "unset", path: f.path }; }),
-          ...snapshot.revision === void 0 ? {} : { expectedRevision: snapshot.revision }
-        }).then(function (response) {
-          if (!response.result.ok) { handleMutateFailure(response); return; }
+        form.mutate(FIELDS.map(function (f) { return { op: "unset", path: f.path }; }), snapshot.revision).then(function (accepted) {
           setBusy(false);
-          setNotice(t("saved"));
-          scope.load();
+          if (accepted) setNotice(t("saved"));
+          else setError(t("conflict"));
         }).catch(function (e) {
           setBusy(false); setError(t("error") + ": " + String(e && e.message || e));
         });
@@ -672,49 +724,43 @@ window.__ModuleLoader__.load({
       return out;
     }
 
-    // ── 记忆浏览器（设置页第二个标签页；经 dsh-self-improved-browser 命名空间数据通道，无需 session）─────
+    // ── 记忆浏览器（设置页第二个标签页；0.2.0 起经 webServer HTTP 端点读取，无需 session）─────
     var KIND_LABEL = { fact: "📖事实", preference: "📌偏好", event: "🧭事件", instruction: "📋指令", persona: "👤画像" };
+    var BROWSER_API = "api/dsh-self-improved";
 
     function BrowserSection(props) {
       var t = props.t;
-      var api = props.api;
-      var scope = props.browserScope;
-      var [snapshot, setSnapshot] = react.useState(function () { return scope.getSnapshot(); });
+      var [data, setData] = react.useState(null);
+      var [detailObj, setDetailObj] = react.useState(null);
       var [busy, setBusy] = react.useState(false);
       var [error, setError] = react.useState(null);
       var [query, setQuery] = react.useState("");
       var [notice, setNotice] = react.useState(null);
       var [closedDetailId, setClosedDetailId] = react.useState(null);
 
-      react.useEffect(function () {
-        scope.load();
-        var alive = true;
-        var sync = function () { if (alive) setSnapshot(scope.getSnapshot()); };
-        var un = typeof scope.subscribe === "function" ? scope.subscribe(sync) : null;
-        // 打开页面时触发一次服务端快照重建（noop 动作），保证一进来就是最新数据
-        try {
-          api.settings.mutate({
-            ns: "dsh-self-improved-browser",
-            ops: [{ op: "set", path: ["action"], value: JSON.stringify({ op: "noop" }) }]
-          });
-        } catch (e) { /* noop */ }
-        return function () { alive = false; if (un) un(); if (scope.dispose) scope.dispose(); };
-      }, [scope]);
+      // 折叠面板开关（hooks 必须全部位于任何条件 return 之前——React #310）
+      var [open, setOpen] = react.useState({ persona: false, memories: true, scenes: false, skills: false });
+      function toggle(k) {
+        setOpen(function (p) { var n = Object.assign({}, p); n[k] = !n[k]; return n; });
+      }
 
-      var data = null;
-      if (snapshot.status === "ready" && snapshot.value && typeof snapshot.value.snapshot === "string") {
-        try { data = JSON.parse(snapshot.value.snapshot); } catch (e) { data = null; }
+      function fetchSnapshot() {
+        return fetch(BROWSER_API + "/browser").then(function (r) {
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          return r.json();
+        }).then(function (res) {
+          if (res && res.snapshot) setData(res.snapshot);
+          return res;
+        });
       }
-      // 详情弹出框数据（服务端按需返回完整记忆）
-      var detailObj = null;
-      if (snapshot.status === "ready" && snapshot.value && typeof snapshot.value.detail === "string" && snapshot.value.detail) {
-        try { detailObj = JSON.parse(snapshot.value.detail); } catch (e) { detailObj = null; }
-      }
+      react.useEffect(function () {
+        var alive = true;
+        fetchSnapshot().catch(function (e) { if (alive) setError(String(e && e.message || e)); });
+        return function () { alive = false; };
+      }, []);
+
       var showDetail = detailObj && detailObj.id !== closedDetailId;
 
-      if (snapshot.status === "unavailable") {
-        return h("p", { className: "__dsi_unavailable" }, t("unavailable"));
-      }
       if (!data) {
         return h("div", { className: "__dsi_root" },
           h("p", { className: "__dsi_status" }, t("browserHint")),
@@ -725,32 +771,43 @@ window.__ModuleLoader__.load({
       var q = query.trim().toLowerCase();
       var filtered = q ? memories.filter(function (m) { return m.content.toLowerCase().indexOf(q) >= 0 || m.kind.indexOf(q) >= 0; }) : memories;
 
-      function sendAction(action) {
-        return api.settings.mutate({
-          ns: "dsh-self-improved-browser",
-          ops: [{ op: "set", path: ["action"], value: JSON.stringify(action) }]
+      // 0.2.0：操作走 POST /api/dsh-self-improved/action，响应直接携带新快照（detail 随响应返回）
+      function sendAction(action, done) {
+        setBusy(true); setNotice(null); setError(null);
+        return fetch(BROWSER_API + "/action", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(action)
+        }).then(function (r) {
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          return r.json();
+        }).then(function (res) {
+          if (res && res.snapshot) setData(res.snapshot);
+          if (res && res.detail !== void 0) setDetailObj(res.detail);
+          setBusy(false);
+          if (done) done(res);
+          return res;
+        }).catch(function (e) {
+          setBusy(false); setError(String(e && e.message || e));
+          return null;
         });
       }
       function viewDetail(m) {
-        setBusy(true); setNotice(null); setError(null);
         setClosedDetailId(null);
-        sendAction({ op: "detail", id: m.id }).then(function () { setBusy(false); }).catch(function (e) { setBusy(false); setError(String(e && e.message || e)); });
+        sendAction({ op: "detail", id: m.id });
       }
       function refresh() {
         setBusy(true); setNotice(null); setError(null);
-        scope.load();
-        setTimeout(function () { setBusy(false); }, 400);
+        fetchSnapshot().then(function () { setBusy(false); }).catch(function (e) { setBusy(false); setError(String(e && e.message || e)); });
       }
       function forget(m) {
         if (!window.confirm(t("browserForgetConfirm") + "\n" + m.content.slice(0, 60))) return;
-        setBusy(true); setNotice(null); setError(null);
-        sendAction({ op: "forget", id: m.id }).then(function () { setNotice(t("browserForgotten")); }).catch(function (e) { setError(String(e && e.message || e)); }).finally(function () { setBusy(false); });
+        sendAction({ op: "forget", id: m.id }, function (res) { if (res) setNotice(t("browserForgotten")); });
       }
       function correct(m) {
         var next = window.prompt(t("browserCorrectPrompt"), m.content);
         if (next === null || !next.trim()) return;
-        setBusy(true); setNotice(null); setError(null);
-        sendAction({ op: "correct", id: m.id, content: next.trim() }).then(function () { setNotice(t("browserCorrected")); }).catch(function (e) { setError(String(e && e.message || e)); }).finally(function () { setBusy(false); });
+        sendAction({ op: "correct", id: m.id, content: next.trim() }, function (res) { if (res) setNotice(t("browserCorrected")); });
       }
 
       var listNodes = filtered.slice(0, 200).map(function (m) {
@@ -777,8 +834,7 @@ window.__ModuleLoader__.load({
       var skills = data.skills || [];
       function deleteSkill(sk) {
         if (!window.confirm(t("browserSkillDeleteConfirm") + "\n" + sk.name)) return;
-        setBusy(true); setNotice(null); setError(null);
-        sendAction({ op: "deleteSkill", name: sk.name }).then(function () { setNotice(t("browserSkillDeleted")); }).catch(function (e) { setError(String(e && e.message || e)); }).finally(function () { setBusy(false); });
+        sendAction({ op: "deleteSkill", name: sk.name }, function (res) { if (res) setNotice(t("browserSkillDeleted")); });
       }
       var skillsNodes = skills.map(function (sk) {
         return h("div", { key: sk.name, className: "__dsi_browserRow" },
@@ -793,11 +849,6 @@ window.__ModuleLoader__.load({
           ) : null);
       });
 
-      // 折叠面板（画像/记忆/场景/技能）
-      var [open, setOpen] = react.useState({ persona: false, memories: true, scenes: false, skills: false });
-      function toggle(k) {
-        setOpen(function (p) { var n = Object.assign({}, p); n[k] = !n[k]; return n; });
-      }
       function collapse(key, title, count, body) {
         var isOpen = open[key];
         return h("div", { className: "__dsi_collapse" + (isOpen ? " __dsi_collapseOpen" : "") },
@@ -890,9 +941,9 @@ window.__ModuleLoader__.load({
     function apply(ctx) {
       var t = ctx.locale.bind(NS);
       ctx.effect(function () { return ctx.locale.register(NS, { zh: zh, en: en }); }, "dsh-self-improved: dictionaries");
-      var scope = ctx.settingsScope.bind({ namespace: "dsh-self-improved" });
-      var browserScope = ctx.settingsScope.bind({ namespace: "dsh-self-improved-browser" });
-      var api = ctx.connection.api;
+      // 0.2.0：设置表单走插件自有 HTTP 通道（非 loopback 页面的官方 configForms 一律 unavailable）；
+      // 记忆浏览器同通道。
+      var form = createHttpConfigForm();
       // 单个设置区，内部两个 Tab：配置 / 记忆
       ctx.slots.inject("settings.section", function () {
         return ctx.slots.register({
@@ -902,7 +953,7 @@ window.__ModuleLoader__.load({
           label: function () { return t("nav"); },
           locale: NS
         }, function (props) {
-          return h(MainSection, Object.assign({}, props, { scope: scope, api: api, browserScope: browserScope }));
+          return h(MainSection, Object.assign({}, props, { form: form }));
         });
       });
     }

@@ -5,6 +5,7 @@
  * 设计对齐：docs/design/dsh-memory-plugin-design.md §4.3
  */
 import type { Context } from "@deepseek-ai/cordis";
+import { SessionLogOffset } from "@deepseek-ai/dsh-session";
 import type { MemoryStore, ConversationSliceRecord } from "./storage.js";
 
 export interface CaptureController {
@@ -29,8 +30,9 @@ export function installCapture(
     if (!controller.enabled()) return;
     const floor = lastWritten.get(session.id) ?? 0;
     const records: ConversationSliceRecord[] = [];
-    for (const event of session.events) {
-      if (event.seq <= floor) continue;
+    // 0.2.0：Session 不再暴露 events 字段，改用 snapshotEvents(fromSeq)（半开区间，fromSeq 含）。
+    // 权威防重仍由 seq 水位保证：floor 之后（含）才是本轮新事件。
+    for (const event of session.snapshotEvents(SessionLogOffset(floor === 0 ? 0 : floor + 1))) {
       const slice = toSlice(session.id, event);
       if (slice) records.push(slice);
     }
